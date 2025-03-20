@@ -1,0 +1,196 @@
+---
+- name: Install RKE2 and Deploy Rancher
+  hosts: controller
+  become: yes
+  tasks:
+    - name: Display Start Message
+      debug:
+        msg: "🚀 Starting installation of RKE2 and Rancher..."
+
+    - name: Update APT repositories
+      apt:
+        update_cache: yes
+      register: apt_update_status
+      changed_when: apt_update_status.changed
+      failed_when: apt_update_status is failed
+
+    - name: Install required dependencies
+      apt:
+        name:
+          - curl
+          - apt-transport-https
+          - gnupg
+          - software-properties-common
+        state: present
+      register: package_status
+      failed_when: package_status is failed
+      notify: "✅ Dependencies installed successfully."
+
+    - name: Check if RKE2 is already installed
+      stat:
+        path: /usr/local/bin/rke2
+      register: rke2_installed
+
+    - name: Install RKE2 if not installed
+      shell: curl -sfL https://get.rke2.io | INSTALL_RKE2_TYPE=server sh -
+      when: not rke2_installed.stat.exists
+      register: rke2_install
+      changed_when: "'Installation complete' in rke2_install.stdout"
+
+    - name: Enable and Start RKE2
+      systemd:
+        name: rke2-server
+        enabled: yes
+        state: started
+      register: rke2_service
+      failed_when: rke2_service is failed
+
+    - name: Ensure kubectl is symlinked to /usr/local/bin
+      file:
+        src: /var/lib/rancher/rke2/bin/kubectl
+        dest: /usr/local/bin/kubectl
+        state: link
+      register: kubectl_symlink
+      changed_when: kubectl_symlink.changed
+
+    - name: Set Kubeconfig for current user
+      lineinfile:
+        path: /etc/environment
+        line: "KUBECONFIG=/etc/rancher/rke2/rke2.yaml"
+        create: yes
+
+    - name: Ensure KUBECONFIG is set for root user
+      lineinfile:
+        path: /root/.bashrc
+        line: "export KUBECONFIG=/etc/rancher/rke2/rke2.yaml"
+        create: yes
+      register: kubeconfig_bashrc
+
+    - name: Ensure KUBECONFIG is set globally
+      lineinfile:
+        path: /etc/environment
+        line: "KUBECONFIG=/etc/rancher/rke2/rke2.yaml"
+        create: yes
+      register: kubeconfig_env
+
+    - name: Reload environment variables
+      shell: bash -c  "source /root/.bashrc"
+      when: kubeconfig_bashrc.changed
+
+    - name: Set permissions for Kubeconfig file
+      file:
+        path: /etc/rancher/rke2/rke2.yaml
+        owner: root
+        group: root
+        mode: "0644"
+
+    - name: Set ownership to dusty for Kubeconfig
+      file:
+        path: /etc/rancher/rke2/rke2.yaml
+        owner: dusty
+        group: dusty
+        mode: "0600"
+
+    - name: Wait for Kubernetes API to become available
+      retries: 15
+      delay: 10
+      shell: KUBECONFIG=/etc/rancher/rke2/rke2.yaml kubectl get nodes
+      register: k8s_ready
+      until: k8s_ready.rc == 0
+      changed_when: false
+      notify: "✅ Kubernetes API is ready."
+
+    - name: Check if Helm is installed
+      shell: "command -v helm"
+      register: helm_check
+      changed_when: false
+      failed_when: false
+
+    - name: Install Helm if not present (Live Output)
+      shell: >
+        bash -c '
+          stdbuf -oL curl -fsSL https://baltocdn.com/helm/signing.asc | apt-key add - &&
+          stdbuf -oL apt-add-repository "deb https://baltocdn.com/helm/stable/debian/ all main" &&
+          stdbuf -oL apt update &&
+          stdbuf -oL apt install -y helm
+        '
+      when: helm_check.rc != 0
+      register: helm_install
+      async: 600
+      poll: 5
+
+    - name: Add Rancher Helm repository
+      command: helm repo add rancher-latest https://releases.rancher.com/server-charts/latest
+      register: helm_repo_add
+      changed_when: "'has been added' in helm_repo_add.stdout"
+
+    - name: Update Helm repositories
+      command: helm repo update
+      register: helm_repo_update
+      changed_when: "'Successfully updated' in helm_repo_update.stdout"
+
+    - name: Ensure Kubernetes namespace for Rancher exists
+      shell: |
+        KUBECONFIG=/etc/rancher/rke2/rke2.yaml kubectl create namespace cattle-system
+      register: rancher_ns
+      failed_when: rancher_ns.rc != 0 and 'AlreadyExists' not in rancher_ns.stderr
+      changed_when: "'created' in rancher_ns.stdout"
+
+    - name: Verify if Rancher is already installed
+      become: yes
+      become_user: dusty
+      shell: |
+        KUBECONFIG=/etc/rancher/rke2/rke2.yaml helm list -n cattle-system
+      register: rancher_check
+      ignore_errors: yes
+
+    - name: Install Cert-Manager CRDs
+      become: yes
+      become_user: dusty
+      shell: |
+        KUBECONFIG=/etc/rancher/rke2/rke2.yaml kubectl apply -f https://github.com/cert-manager/cert-manager/releases/latest/download/cert-manager.crds.yaml
+      register: cert_manager_crds
+      changed_when: "'created' in cert_manager_crds.stdout or 'configured' in cert_manager_crds.stdout"
+
+    - name: Install Rancher using Helm
+      become: yes
+      shell: |
+        RANCHER_HOSTNAME=$(hostname).local && \
+        KUBECONFIG=/etc/rancher/rke2/rke2.yaml helm install rancher rancher-latest/rancher \
+        --namespace cattle-system \
+        --set hostname=${RANCHER_HOSTNAME}
+      when: "'rancher' not in rancher_check.stdout"
+      register: rancher_install
+      notify: "✅ Rancher installed successfully."
+
+    - name: Wait for Rancher pods to be ready
+      become: yes
+      become_user: dusty
+      retries: 40
+      delay: 10
+      shell: |
+        KUBECONFIG=/etc/rancher/rke2/rke2.yaml kubectl get pods -n cattle-system -o jsonpath='{.items[*].status.phase}'
+      register: rancher_pods_status
+      until: "'Running' in rancher_pods_status.stdout"
+      changed_when: false
+
+    - name: Display Rancher installation status
+      debug:
+        msg: "🚀 Rancher is now installed! Access it at: https://rancher.yourdomain.com"
+
+  handlers:
+    - name: ✅ Dependencies installed successfully.
+      debug:
+        msg: "✅ All required dependencies are installed."
+
+    - name: ✅ Kubernetes API is ready.
+      debug:
+        msg: "✅ Kubernetes API is now available."
+
+    - name: ✅ Helm installed successfully.
+      debug:
+        msg: "✅ Helm installation completed."
+
+    - name: ✅ Rancher installed successfully.
+      debug:
+        msg: "✅ Rancher installation completed."

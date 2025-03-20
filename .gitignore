@@ -1,0 +1,11 @@
+*.ini
+*.env
+.terraform
+.terraform.lock.hcl
+*.img
+id*
+*.pub
+*.tfstate*
+.DS_Store
+*.tfvars
+.git

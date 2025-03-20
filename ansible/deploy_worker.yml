@@ -1,0 +1,84 @@
+---
+- name: Add Worker Nodes to RKE2 Cluster
+  hosts: workers
+  become: yes
+  tasks:
+    - name: Display Start Message
+      debug:
+        msg: "🚀 Adding worker node to RKE2 cluster..."
+
+    - name: Ensure required dependencies are installed
+      apt:
+        name:
+          - curl
+          - iproute2
+          - apt-transport-https
+          - gnupg
+          - software-properties-common
+        state: present
+        update_cache: yes
+
+    - name: Fetch RKE2 node token from the controller
+      delegate_to: k8s-controller
+      become: yes
+      command: cat /var/lib/rancher/rke2/server/node-token
+      register: node_token
+      changed_when: false
+      run_once: true
+
+    - name: Fetch controller node IP from inventory
+      set_fact:
+        controller_ip: "{{ hostvars['k8s-controller']['ansible_host'] }}"
+
+    - name: Install RKE2 (Agent)
+      shell: curl -sfL https://get.rke2.io | INSTALL_RKE2_TYPE="agent" sh -
+
+    - name: Ensure /etc/rancher/rke2 directory exists
+      file:
+        path: /etc/rancher/rke2
+        state: directory
+        mode: "0755"
+
+    - name: Configure RKE2 Agent
+      copy:
+        dest: /etc/rancher/rke2/config.yaml
+        content: |
+          server: https://{{ controller_ip }}:9345
+          token: "{{ node_token.stdout }}"
+        mode: "0600"
+
+    - name: Enable and Start RKE2 Agent
+      systemd:
+        name: rke2-agent
+        enabled: yes
+        state: started
+
+    - name: Verify Node is Joined
+      retries: 10
+      delay: 10
+      shell: KUBECONFIG=/etc/rancher/rke2/rke2.yaml kubectl get nodes --no-headers | grep $(hostname) || true
+      delegate_to: k8s-controller
+      register: node_joined
+      until: node_joined.rc == 0
+      changed_when: false
+
+    - name: Debug node_joined output
+      debug:
+        var: node_joined.stdout_lines
+
+    - name: Display Completion Message
+      debug:
+        msg: "✅ Worker node successfully added to the RKE2 cluster!"
+
+    - name: Display Cluster Node Status from Controller (Name & Status Only)
+      delegate_to: k8s-controller
+      become: yes
+      shell: KUBECONFIG=/etc/rancher/rke2/rke2.yaml kubectl get nodes -o custom-columns="NAME:.metadata.name,STATUS:.status.conditions[-1].type"
+      register: cluster_nodes
+      changed_when: false
+      run_once: true # Ensures it runs only once
+
+    - name: Output Cluster Node Status
+      debug:
+        msg: "{{ cluster_nodes.stdout_lines }}"
+      run_once: true # Ensures it only prints once
